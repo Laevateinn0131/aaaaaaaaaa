@@ -1,222 +1,161 @@
-import streamlit as st
-from urllib.parse import urlparse
+import os
 import re
+from urllib.parse import urlparse
+import streamlit as st
+import google.generativeai as genai
 
-st.set_page_config(page_title="詐欺対策総合アプリ", page_icon="🛡️", layout="wide")
+# =====================================
+# 🔑 Gemini APIの設定
+# =====================================
+# セキュリティのため、環境変数で設定することを推奨
+# 例: Windowsなら PowerShell で以下を実行
+# setx GEMINI_API_KEY "あなたのAPIキー"
+#
+# ここでは直接セット（デモ用）
+os.environ["GEMINI_API_KEY"] = "AIzaSyDuxrHGEiBATrTUQ6iqiZqe_oyNbNL58Ww"
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-# ==== ページナビゲーション ====
-st.sidebar.title("🛡️ 詐欺対策総合アプリ")
-page = st.sidebar.radio("メニュー", [
-    "🏠 ホーム",
-    "📞 電話番号チェック",
-    "🔗 URLチェック",
-    "📧 メールチェック",
-    "🧩 学習クイズ",
-    "📚 ガイド",
-    "🗂️ 脅威データベース"
-])
+# 使用モデルを指定
+model = genai.GenerativeModel("gemini-1.5-pro")
 
-# ==== 分析ロジック ====
+# =====================================
+# Streamlit設定
+# =====================================
+st.set_page_config(page_title="🛡️ Gemini詐欺対策アプリ", page_icon="🧠", layout="wide")
 
-def analyze_phone(number):
-    normalized = re.sub(r"[-\s()]+", "", number)
-    risk = "安全"
-    score = 10
-    warnings, details = [], []
-    caller = {"種別": "不明", "カテゴリ": "その他", "信頼度": "低"}
+st.sidebar.title("🧠 Gemini AI 詐欺対策ツール")
+page = st.sidebar.radio("メニュー", ["🏠 ホーム", "📞 電話番号", "🔗 URL", "📧 メール", "🧩 クイズ", "📚 ガイド"])
 
-    if normalized in ["110", "119", "118"]:
-        risk, score = "緊急", 100
-        caller = {"種別": "緊急通報番号", "カテゴリ": "公的機関", "信頼度": "確実"}
-        details.append("✅ 緊急通報番号です")
-    elif normalized.startswith(("0120", "0800")):
-        caller = {"種別": "企業カスタマーサポート", "カテゴリ": "企業", "信頼度": "中"}
-        details.append("📞 フリーダイヤル（通話無料）")
-    elif normalized.startswith("050"):
-        risk, score = "注意", 60
-        caller = {"種別": "IP電話", "カテゴリ": "不明", "信頼度": "低"}
-        warnings.append("⚠️ IP電話は匿名性が高く、詐欺に悪用されやすい")
-    elif normalized.startswith(("090", "080", "070")):
-        caller = {"種別": "携帯電話", "カテゴリ": "個人", "信頼度": "高"}
-        details.append("📱 個人契約の携帯電話")
-    elif normalized.startswith("03"):
-        caller = {"種別": "固定電話", "カテゴリ": "企業または個人", "信頼度": "中"}
-        details.append("🏢 固定電話（東京地域）")
-    elif normalized.startswith(("+", "010")):
-        risk, score = "注意", 70
-        caller = {"種別": "国際電話", "カテゴリ": "国際", "信頼度": "中"}
-        warnings.append("🌍 国際電話 - 身に覚えがない場合は応答しない")
-
-    scam_numbers = ["0312345678", "0120999999", "05011112222"]
-    if normalized in scam_numbers:
-        risk, score = "危険", 95
-        warnings.append("🚨 既知の詐欺電話番号です！")
-
-    return risk, score, warnings, details, caller
-
-
-def analyze_url(url):
+# =====================================
+# 🔍 Geminiに分析を依頼する関数
+# =====================================
+def gemini_analyze(prompt):
+    """Gemini APIで自然言語によるリスク分析を行う"""
     try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        risk, score = "安全", 10
-        warnings, details = [], []
-        details.append(f"ドメイン: {host}")
-        details.append(f"プロトコル: {parsed.scheme}")
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"⚠️ Gemini分析中にエラーが発生しました: {e}"
 
-        if parsed.scheme == "http":
-            warnings.append("⚠️ HTTPSではありません（暗号化されていません）")
-            risk, score = "注意", 40
-        if any(x in host for x in ["paypal-secure-login", "amazon-verify", "apple-support-id"]):
-            warnings.append("🚨 詐欺サイトパターン検出！")
-            risk, score = "危険", 95
-        if re.match(r"\d{1,3}(\.\d{1,3}){3}", host):
-            warnings.append("⚠️ IPアドレス形式のURLです")
-            risk, score = "注意", max(score, 60)
-        if any(x in host for x in ["bit.ly", "t.co", "tinyurl.com"]):
-            warnings.append("ℹ️ 短縮URLです。実際のリンク先を確認してください。")
-        return risk, score, warnings, details
-    except Exception:
-        return "エラー", 0, ["❌ 無効なURLです"], []
-
-
-def analyze_email(text):
-    risk, score = "安全", 10
-    warnings, details = [], []
-    suspicious = ["verify account", "urgent action", "アカウント確認", "緊急", "本人確認", "パスワード更新"]
-    found = [k for k in suspicious if k.lower() in text.lower()]
-    if found:
-        warnings.append("⚠️ 疑わしいキーワード: " + ", ".join(found))
-        risk, score = "注意", 50
-    urls = re.findall(r"https?://[^\s]+", text)
-    if urls:
-        details.append(f"検出URL数: {len(urls)}")
-        for u in urls:
-            urisk, uscore, _, _ = analyze_url(u)
-            if urisk == "危険":
-                risk, score = "危険", 90
-                warnings.append("🚨 危険なURLが含まれています")
-    if any(x in text for x in ["今すぐ", "24時間以内", "urgent", "immediately"]):
-        warnings.append("⚠️ 緊急性を煽る表現が含まれています")
-        score = min(score + 20, 100)
-    return risk, score, warnings, details
-
-# ==== ページ構成 ====
-
+# =====================================
+# 🏠 ホーム
+# =====================================
 if page == "🏠 ホーム":
-    st.title("🛡️ 詐欺対策総合アプリ")
+    st.title("🧠 Gemini AI 詐欺対策総合アプリ")
     st.markdown("""
-    電話番号・URL・メールの安全性を総合的にチェックできます。  
-    また、詐欺パターンを学べるクイズや安全ガイドも搭載。
+    Google Gemini AI を活用して、  
+    電話番号・URL・メール内容などを自動分析し、  
+    フィッシングや詐欺の可能性を評価します。
     """)
     st.image("https://img.icons8.com/color/480/shield.png", width=120)
-    st.markdown("### 主な機能")
-    st.markdown("""
-    - 📞 電話番号のリスク分析  
-    - 🔗 URLの安全性チェック  
-    - 📧 メールの詐欺パターン検出  
-    - 🧩 クイズ形式の学習  
-    - 🗂️ リアルタイム脅威データベース  
-    """)
+    st.info("Gemini AI モデル: gemini-1.5-pro")
 
-elif page == "📞 電話番号チェック":
-    st.header("📞 電話番号チェック")
-    number = st.text_input("電話番号を入力してください", "050-1111-2222")
-    if st.button("分析する"):
-        risk, score, warns, details, caller = analyze_phone(number)
-        st.subheader(f"リスク判定: {risk}（スコア {score}/100）")
-        st.write("**発信者タイプ:**")
-        st.json(caller)
-        if warns: st.warning("\n".join(warns))
-        if details: st.info("\n".join(details))
+# =====================================
+# 📞 電話番号分析
+# =====================================
+elif page == "📞 電話番号":
+    st.header("📞 電話番号リスク分析")
+    phone = st.text_input("電話番号を入力してください", "050-1111-2222")
 
-elif page == "🔗 URLチェック":
-    st.header("🔗 URLチェック")
+    if st.button("Geminiで分析"):
+        prompt = f"""
+        以下の電話番号に関して、詐欺や迷惑電話のリスクを日本語で評価してください。
+        可能であれば番号の特徴（IP電話、携帯、公的機関など）を説明し、
+        詐欺に使われやすいパターンとの一致を指摘してください。
+        電話番号: {phone}
+        """
+        result = gemini_analyze(prompt)
+        st.subheader("🔍 Gemini分析結果")
+        st.write(result)
+
+# =====================================
+# 🔗 URL分析
+# =====================================
+elif page == "🔗 URL":
+    st.header("🔗 URL安全性チェック")
     url = st.text_input("URLを入力してください", "http://paypal-secure-login.com")
-    if st.button("チェック"):
-        risk, score, warns, details = analyze_url(url)
-        st.subheader(f"リスク判定: {risk}（スコア {score}/100）")
-        if warns: st.warning("\n".join(warns))
-        if details: st.info("\n".join(details))
 
-elif page == "📧 メールチェック":
-    st.header("📧 メールチェック")
-    mail = st.text_area("メール本文を貼り付けてください", height=200)
-    if st.button("分析する"):
-        risk, score, warns, details = analyze_email(mail)
-        st.subheader(f"リスク判定: {risk}（スコア {score}/100）")
-        if warns: st.warning("\n".join(warns))
-        if details: st.info("\n".join(details))
+    if st.button("Geminiで分析"):
+        prompt = f"""
+        次のURLが詐欺・フィッシング・マルウェアサイトの可能性があるかを日本語で分析してください。
+        ドメイン構造や不審な単語、プロトコルの安全性も説明してください。
+        URL: {url}
+        """
+        result = gemini_analyze(prompt)
+        st.subheader("🔍 Gemini分析結果")
+        st.write(result)
 
-elif page == "🧩 学習クイズ":
-    st.header("🧩 フィッシング詐欺クイズ")
-    quizzes = [
-        {
-            "subject": "【重要】あなたのアカウントが一時停止されました",
-            "content": "不審なアクセスが検出されました。以下のリンクから確認してください。\nhttp://security-update-login.com",
-            "is_phish": True,
-            "explain": "正規のドメインではありません。"
-        },
-        {
-            "subject": "【Amazon】ご注文ありがとうございます",
-            "content": "ご注文いただいた商品は10月12日に発送されます。",
-            "is_phish": False,
-            "explain": "自然な内容で詐欺ではありません。"
-        }
-    ]
-    if "q" not in st.session_state: st.session_state.q = 0
-    if "score" not in st.session_state: st.session_state.score = 0
-    q = quizzes[st.session_state.q]
-    st.markdown(f"#### 件名: {q['subject']}")
-    st.code(q["content"])
-    ans = st.radio("これは詐欺メールですか？", ["🚨 フィッシングメール", "✅ 安全なメール"])
-    if st.button("回答"):
-        correct = (ans.startswith("🚨") and q["is_phish"]) or (ans.startswith("✅") and not q["is_phish"])
-        if correct:
-            st.success("✅ 正解！")
-            st.session_state.score += 1
-        else:
-            st.error("❌ 不正解")
-        st.info(f"💡 解説: {q['explain']}")
-        if st.session_state.q < len(quizzes) - 1:
-            st.button("次へ", on_click=lambda: st.session_state.update(q=st.session_state.q+1))
-        else:
-            st.balloons()
-            st.success(f"🎉 終了！スコア: {st.session_state.score}/{len(quizzes)}")
-            st.button("最初からやり直す", on_click=lambda: st.session_state.update(q=0, score=0))
+# =====================================
+# 📧 メール本文分析
+# =====================================
+elif page == "📧 メール":
+    st.header("📧 メール本文チェック")
+    email_text = st.text_area("メール本文を貼り付けてください", height=200)
 
+    if st.button("Geminiで分析"):
+        prompt = f"""
+        以下のメール本文を解析し、詐欺・フィッシング・スパムの可能性を評価してください。
+        不審な点、怪しい文面、偽装URLがあれば説明してください。
+        結果を日本語で簡潔に出力。
+        ----
+        {email_text}
+        """
+        result = gemini_analyze(prompt)
+        st.subheader("🔍 Gemini分析結果")
+        st.write(result)
+
+# =====================================
+# 🧩 クイズ
+# =====================================
+elif page == "🧩 クイズ":
+    st.header("🧩 詐欺パターンクイズ（Gemini解説付き）")
+
+    quiz = {
+        "subject": "【重要】アカウントが停止されました",
+        "body": "あなたのアカウントに不正アクセスがありました。以下のリンクから確認してください。\nhttp://security-update-login.com",
+    }
+
+    st.markdown(f"#### 件名: {quiz['subject']}")
+    st.code(quiz['body'])
+
+    ans = st.radio("このメールは安全ですか？", ["🚨 危険な可能性が高い", "✅ 安全そう"])
+
+    if st.button("Geminiの解説を見る"):
+        prompt = f"""
+        以下のメールがフィッシング詐欺かどうかを日本語で判断し、理由を短く説明してください。
+        ----
+        件名: {quiz['subject']}
+        本文: {quiz['body']}
+        """
+        explanation = gemini_analyze(prompt)
+        st.info(explanation)
+
+# =====================================
+# 📚 ガイド
+# =====================================
 elif page == "📚 ガイド":
-    st.header("📚 詐欺対策ガイド")
+    st.header("📚 詐欺対策ガイド（Geminiヒント付き）")
+
     st.markdown("""
-    ### 🚨 電話詐欺の特徴
-    - 050や国際電話
-    - 公的機関を名乗る
-    - 緊急性を装う
-    - 金銭要求
+    ### 💡 電話詐欺の特徴
+    - 「警察」「金融庁」などを名乗る
+    - 急に金銭や個人情報を求める
+    - 国際・050番号は要注意
 
-    ### ⚠️ フィッシングメールの特徴
-    - 「アカウント停止」「24時間以内」などの表現
-    - 不自然な日本語やURL
+    ### 🌐 フィッシング詐欺の特徴
+    - 「アカウント停止」「緊急確認」など不安を煽る言葉
+    - 不自然な日本語や偽ドメイン
 
-    ### ✅ 対策方法
+    ### ✅ 安全対策
     - 不審なリンクは開かない  
-    - 公式サイトに直接アクセス  
-    - 知らない番号には出ない  
-    - 個人情報を電話やメールで教えない  
+    - 公式サイトで直接ログイン  
+    - 電話・メールで個人情報を答えない
     """)
 
-elif page == "🗂️ 脅威データベース":
-    st.header("🗂️ 既知の脅威データベース")
-    st.subheader("📞 詐欺電話番号")
-    st.code("03-1234-5678\n0120-999-999\n050-1111-2222\n090-1234-5678")
+    if st.button("Geminiに最新傾向を聞く"):
+        prompt = "2025年現在、日本国内で増えている詐欺やフィッシング手口の傾向を簡潔に説明してください。"
+        trend = gemini_analyze(prompt)
+        st.subheader("🧠 Geminiの最新知見")
+        st.write(trend)
 
-    st.subheader("🌍 危険ドメイン例")
-    st.code("paypal-secure-login.com\namazon-verify.net\napple-support-id.com")
-
-    st.subheader("⚠️ 疑わしいキーワード")
-    st.write(", ".join([
-        "verify account", "urgent action", "アカウント確認",
-        "本人確認", "24時間以内", "パスワード更新"
-    ]))
-
-st.sidebar.info("⚠️ このアプリは参考ツールです。最終判断は慎重に行ってください。")
+st.sidebar.info("⚠️ Gemini AIの出力は参考情報です。最終的な判断はご自身で行ってください。")
