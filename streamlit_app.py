@@ -11,7 +11,7 @@ try:
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-
+    
 # ページ設定
 st.set_page_config(
     page_title="統合セキュリティチェッカー",
@@ -123,13 +123,19 @@ if 'answered' not in st.session_state:
 if 'last_check' not in st.session_state:
     st.session_state.last_check = None
 
+if 'gemini_key' not in st.session_state:
+    st.session_state.gemini_key = ""
+    
+if 'use_gemini' not in st.session_state:
+    st.session_state.use_gemini = False
+
 # クイズサンプルデータ
 quiz_samples = [
     {
         "subject": "【重要】あなたのアカウントが一時停止されました",
         "content": "お客様のアカウントに不審なアクセスが検出されました。以下のリンクから確認してください。\n→ http://security-update-login.com",
         "is_phishing": True,
-        "explanation": "正規のドメインではなく、不審なURLを使用しています。"
+        "explanation": "正規のドメインではなく、不審なURLを使用しています。また、緊急性を煽るタイトルです。"
     },
     {
         "subject": "【Amazon】ご注文ありがとうございます",
@@ -141,7 +147,7 @@ quiz_samples = [
         "subject": "【Apple ID】アカウント情報の確認が必要です",
         "content": "セキュリティのため、以下のURLから24時間以内に情報を更新してください。\n→ http://apple.login-check.xyz",
         "is_phishing": True,
-        "explanation": "URLが公式のAppleドメインではありません。典型的なフィッシングサイトの形式です。"
+        "explanation": "URLが公式のAppleドメイン（apple.comなど）ではありません。『24時間以内』という緊急性もフィッシングの特徴です。"
     },
     {
         "subject": "【楽天】ポイント還元のお知らせ",
@@ -150,6 +156,7 @@ quiz_samples = [
         "explanation": "不自然なURLや情報要求がなく、自然な表現です。"
     },
 ]
+random.shuffle(quiz_samples) # クイズをランダム化
 
 # 関数定義
 def setup_gemini(api_key):
@@ -174,7 +181,13 @@ def analyze_url_local(url):
     }
     
     try:
-        parsed = urlparse(url)
+        # URLの整形を試みる（schemeがない場合の補完）
+        if not re.match(r'https?://', url):
+            url_with_scheme = 'http://' + url
+        else:
+            url_with_scheme = url
+            
+        parsed = urlparse(url_with_scheme)
         domain = parsed.netloc.lower()
         
         if not domain:
@@ -189,9 +202,16 @@ def analyze_url_local(url):
             results["risk_score"] = 95
             results["warnings"].append("⚠️ 既知の詐欺サイトです！直ちにアクセスを中止してください")
         
+        # ユーザー通報ドメインチェック
+        if any(d == domain for d in st.session_state.reported_sites):
+             if results["risk_level"] != "危険":
+                 results["risk_level"] = "注意"
+                 results["risk_score"] = max(results["risk_score"], 70)
+             results["warnings"].append("🚨 ユーザーから通報されたドメインと一致します")
+        
         # パターンマッチング
         for pattern in st.session_state.threat_database["dangerous_patterns"]:
-            if re.search(pattern, url):
+            if re.search(pattern, url_with_scheme):
                 if results["risk_level"] == "安全":
                     results["risk_level"] = "注意"
                     results["risk_score"] = 60
@@ -207,7 +227,7 @@ def analyze_url_local(url):
         
         # 短縮URLチェック
         short_domains = ["bit.ly", "tinyurl.com", "t.co", "goo.gl"]
-        if any(s in domain for s in short_domains):
+        if any(d in domain for d in short_domains):
             results["warnings"].append("ℹ️ 短縮URLです。実際のリンク先を確認してください")
         
         # 詳細情報
@@ -228,7 +248,8 @@ def analyze_email_local(content):
         "risk_level": "安全",
         "risk_score": 10,
         "warnings": [],
-        "details": []
+        "details": [],
+        "ai_analysis": None
     }
     
     # キーワードチェック
@@ -240,7 +261,7 @@ def analyze_email_local(content):
     if found_keywords:
         results["risk_level"] = "注意"
         results["risk_score"] = 50
-        results["warnings"].append(f"⚠️ 疑わしいキーワード検出: {', '.join(found_keywords[:3])}")
+        results["warnings"].append(f"⚠️ 疑わしいキーワード検出: {', '.join(found_keywords[:5])}など")
     
     # URLチェック
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', content)
@@ -256,7 +277,7 @@ def analyze_email_local(content):
             elif url_result["risk_level"] == "注意" and results["risk_level"] != "危険":
                 results["risk_level"] = "注意"
                 results["risk_score"] = max(results["risk_score"], 60)
-        
+            
         if dangerous_urls:
             results["warnings"].append(f"🚨 危険なURL発見: {len(dangerous_urls)}件")
     
@@ -268,11 +289,50 @@ def analyze_email_local(content):
     
     return results
 
+def analyze_email_with_gemini(content):
+    """Gemini AIによるメール内容分析"""
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = f"""
+あなたはフィッシング詐欺の専門家です。以下のメール内容を分析し、フィッシングの可能性を評価してください。
+特に、送信者、緊急性、不審なリンク（ダミーURL）に注目してください。
+
+メール内容:
+---
+{content}
+---
+
+以下を分析してJSON形式で回答:
+{{
+    "ai_risk_assessment": "高リスク/中リスク/低リスク",
+    "risk_score": 0-100,
+    "reasons": ["具体的な疑わしい点"],
+    "summary": "総合分析（100文字程度）"
+}}
+"""
+        
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=1000,
+            )
+        )
+        
+        json_match = re.search(r'\{[\s\S]*\}', response.text)
+        if json_match:
+            return json.loads(json_match.group())
+        return {"summary": "AI分析結果を解析できませんでした。", "ai_risk_assessment": "不明", "risk_score": 0}
+    except Exception as e:
+        return {"summary": f"AI分析エラー: {str(e)}", "ai_risk_assessment": "エラー", "risk_score": 0}
+
+
 def identify_area(number):
     """地域識別"""
     area_codes = {
         "03": "東京", "06": "大阪", "052": "名古屋",
-        "011": "札幌", "092": "福岡", "075": "京都"
+        "011": "札幌", "092": "福岡", "075": "京都", "045": "横浜"
     }
     for code, area in area_codes.items():
         if number.startswith(code):
@@ -281,7 +341,9 @@ def identify_area(number):
 
 def identify_number_type(normalized):
     """番号タイプ識別"""
-    if normalized.startswith('0120') or normalized.startswith('0800'):
+    if normalized in st.session_state.scam_database["safe_prefixes"]:
+        return "緊急通報"
+    elif normalized.startswith('0120') or normalized.startswith('0800'):
         return "フリーダイヤル"
     elif normalized.startswith('050'):
         return "IP電話"
@@ -323,6 +385,7 @@ def identify_caller_type(number, normalized):
     }
     
     for prefix, org in government_patterns.items():
+        # numberの最初の6-7桁とprefixを比較
         if number.startswith(prefix):
             caller_info["type"] = "公的機関"
             caller_info["confidence"] = "高"
@@ -348,40 +411,37 @@ def identify_caller_type(number, normalized):
             return caller_info
     
     # 番号タイプによる判定
-    if normalized.startswith('0120') or normalized.startswith('0800'):
+    number_type = identify_number_type(normalized)
+    
+    if number_type == "フリーダイヤル":
         caller_info["type"] = "企業カスタマーサポート"
         caller_info["confidence"] = "中"
         caller_info["category"] = "一般企業"
         caller_info["details"].append("フリーダイヤル（通話無料）")
         caller_info["details"].append("企業からの連絡が多い")
-    elif normalized.startswith('0570'):
+    elif number_type == "ナビダイヤル":
         caller_info["type"] = "企業ナビダイヤル"
         caller_info["confidence"] = "中"
         caller_info["category"] = "一般企業"
         caller_info["details"].append("通話料有料（高額になることも）")
         caller_info["details"].append("企業のサポートセンター等")
-    elif normalized.startswith('050'):
+    elif number_type == "IP電話":
         caller_info["type"] = "IP電話利用者"
         caller_info["confidence"] = "低"
         caller_info["category"] = "不明"
         caller_info["details"].append("個人/企業どちらも可能性あり")
         caller_info["details"].append("IP電話は匿名性が高い")
         caller_info["details"].append("⚠️ 詐欺に悪用されやすい")
-    elif normalized.startswith('090') or normalized.startswith('080') or normalized.startswith('070'):
+    elif number_type == "携帯電話":
         caller_info["type"] = "個人携帯電話"
         caller_info["confidence"] = "高"
         caller_info["category"] = "個人"
         caller_info["details"].append("個人契約の携帯電話")
         caller_info["details"].append("まれに法人契約もあり")
-    elif normalized.startswith('020'):
-        caller_info["type"] = "ポケベル・M2M"
-        caller_info["confidence"] = "高"
-        caller_info["category"] = "特殊"
-        caller_info["details"].append("IoT機器等の通信")
-    elif normalized.startswith('0'):
+    elif number_type == "固定電話":
         area = identify_area(number)
         if area != "不明":
-            caller_info["type"] = "固定電話（企業または個人宅）"
+            caller_info["type"] = f"固定電話（{area}）"
             caller_info["confidence"] = "中"
             caller_info["category"] = "企業または個人"
             caller_info["details"].append(f"地域: {area}")
@@ -390,7 +450,7 @@ def identify_caller_type(number, normalized):
             caller_info["type"] = "固定電話"
             caller_info["confidence"] = "低"
             caller_info["category"] = "不明"
-    elif number.startswith('+') or normalized.startswith('010'):
+    elif number_type == "国際電話":
         caller_info["type"] = "国際電話"
         caller_info["confidence"] = "確実"
         caller_info["category"] = "国際"
@@ -401,6 +461,14 @@ def identify_caller_type(number, normalized):
 
 def analyze_phone_number(number, use_ai=False, api_key=None):
     """電話番号解析"""
+    # エラーチェック
+    if not number:
+        return {
+            "original": "", "normalized": "", "risk_level": "エラー",
+            "warnings": ["番号が入力されていません"], "details": [], "recommendations": [],
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ai_analysis": None, "caller_type": None
+        }
+
     normalized = re.sub(r'[-\s()]+', '', number)
     
     result = {
@@ -412,7 +480,8 @@ def analyze_phone_number(number, use_ai=False, api_key=None):
         "recommendations": [],
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ai_analysis": None,
-        "caller_type": None
+        "caller_type": None,
+        "risk_score": 10
     }
     
     # 発信者タイプ識別
@@ -422,29 +491,35 @@ def analyze_phone_number(number, use_ai=False, api_key=None):
     # 緊急番号チェック
     if normalized in ["110", "119", "118"]:
         result["risk_level"] = "緊急"
+        result["risk_score"] = 0
         result["details"].append("✅ 緊急通報番号です")
+        st.session_state.phone_check_history.append(result)
         return result
     
     # 既知の詐欺番号チェック
-    if number in st.session_state.scam_database["known_scam_numbers"]:
+    if normalized in [re.sub(r'[-\s()]+', '', d) for d in st.session_state.scam_database["known_scam_numbers"]]:
         result["risk_level"] = "危険"
-        result["warnings"].append("🚨 既知の詐欺電話番号です！")
+        result["risk_score"] = 95
+        result["warnings"].append("🚨 既知の詐欺電話番号と一致します！")
         result["recommendations"].append("❌ 絶対に応答しないでください")
         result["recommendations"].append("📞 着信拒否設定を推奨")
     
     # ユーザー通報データチェック
-    for case in st.session_state.scam_database["reported_cases"]:
-        if case["number"] == number:
-            result["risk_level"] = "危険"
-            result["warnings"].append(f"⚠️ {case['reports']}件の通報あり")
-            result["details"].append(f"通報内容: {case['description'][:100]}...")
+    report_count = sum(1 for case in st.session_state.scam_database["reported_cases"] if re.sub(r'[-\s()]+', '', case["number"]) == normalized)
+    if report_count > 0:
+        if result["risk_level"] == "安全":
+            result["risk_level"] = "注意"
+            result["risk_score"] = max(result["risk_score"], 70)
+        result["warnings"].append(f"⚠️ {report_count}件の通報あり")
+        result["details"].append(f"最新の通報内容: {st.session_state.scam_database['reported_cases'][-1]['description'][:50]}...")
     
     # プレフィックスチェック
     for prefix in st.session_state.scam_database["suspicious_prefixes"]:
         if normalized.startswith(prefix):
             if result["risk_level"] == "安全":
                 result["risk_level"] = "注意"
-            result["warnings"].append(f"⚠️ 疑わしいプレフィックス: {prefix}")
+                result["risk_score"] = max(result["risk_score"], 40)
+            result["warnings"].append(f"⚠️ 疑わしいプレフィックス: {prefix} (詐欺に悪用されやすい)")
             result["recommendations"].append("慎重に対応してください")
     
     # パターンチェック
@@ -452,17 +527,19 @@ def analyze_phone_number(number, use_ai=False, api_key=None):
         if re.match(pattern, normalized):
             if result["risk_level"] == "安全":
                 result["risk_level"] = "注意"
-            result["warnings"].append("⚠️ 警戒が必要なパターンです")
+                result["risk_score"] = max(result["risk_score"], 30)
+            result["warnings"].append("⚠️ 警戒が必要なパターンです (例: 国際電話、フリーダイヤル)")
     
     # 国際電話チェック
-    if number.startswith('+') or normalized.startswith('010'):
+    if normalized.startswith('+') or normalized.startswith('010'):
         result["warnings"].append("🌍 国際電話です")
         result["recommendations"].append("身に覚えがない場合は応答しない")
         if result["risk_level"] == "安全":
             result["risk_level"] = "注意"
+            result["risk_score"] = max(result["risk_score"], 50)
     
-    # 詳細情報
-    result["details"].append(f"📱 番号タイプ: {identify_number_type(normalized)}")
+    # 詳細情報（発信者タイプから取得）
+    result["details"].append(f"📱 番号タイプ: {caller_type['type']}")
     result["details"].append(f"📍 地域: {identify_area(number)}")
     
     # 安全な場合の推奨事項
@@ -471,13 +548,22 @@ def analyze_phone_number(number, use_ai=False, api_key=None):
         result["recommendations"].append("💡 不審な要求には注意してください")
     
     # AI分析
-    if use_ai and api_key:
-        if setup_gemini(api_key):
-            with st.spinner("🤖 AIが高度な分析を実行中..."):
-                ai_result = analyze_phone_with_gemini(number, result, api_key)
-                if ai_result:
-                    result["ai_analysis"] = ai_result
-    
+    if use_ai and api_key and GEMINI_AVAILABLE and setup_gemini(api_key):
+        with st.spinner("🤖 AIが高度な分析を実行中..."):
+            ai_result = analyze_phone_with_gemini(number, result, api_key)
+            if ai_result:
+                result["ai_analysis"] = ai_result
+                # AIの結果をリスクに反映
+                if ai_result.get('ai_risk_assessment') == "危険" and result["risk_level"] != "危険":
+                    result["risk_level"] = "危険"
+                    result["risk_score"] = max(result["risk_score"], 90)
+                elif ai_result.get('ai_risk_assessment') == "注意" and result["risk_level"] == "安全":
+                    result["risk_level"] = "注意"
+                    result["risk_score"] = max(result["risk_score"], 70)
+                elif ai_result.get('risk_score') is not None:
+                    result["risk_score"] = max(result["risk_score"], ai_result.get('risk_score'))
+
+
     # 履歴に追加
     st.session_state.phone_check_history.append(result)
     return result
@@ -489,42 +575,51 @@ def analyze_phone_with_gemini(number, basic_result, api_key):
         caller_type_info = basic_result.get('caller_type', {})
         
         prompt = f"""
-あなたは電話番号の専門家です。以下の情報から、この電話番号の詳細を分析してください。
+あなたは電話番号の専門家です。以下の情報から、この電話番号の詳細を分析してください。この分析は、詐欺の可能性を評価するためのものです。
 
 電話番号: {number}
 正規化: {basic_result['normalized']}
 発信者タイプ: {caller_type_info.get('type', '不明')}
 カテゴリ: {caller_type_info.get('category', '不明')}
-現在のリスクレベル: {basic_result['risk_level']}
+基本リスクレベル: {basic_result['risk_level']}
 
-以下を分析してJSON形式で回答:
+以下を分析して、JSON形式で回答してください。JSON以外は含めないでください。
 {{
-   "ai_risk_assessment": "安全/注意/危険",
-   "confidence_score": 0-100,
-   "business_type": "具体的な業種",
-   "fraud_patterns": ["考えられる詐欺パターン"],
-   "recommendations": ["推奨行動"],
-   "summary": "総合分析（100文字程度）"
+    "ai_risk_assessment": "安全/注意/危険",
+    "risk_score": 0-100,
+    "business_type": "具体的な業種 (例: カスタマーサポート、セールス、個人)",
+    "fraud_patterns": ["考えられる詐欺パターン (例: 還付金詐欺、架空請求、ワン切り)"],
+    "recommendations": ["推奨行動 (例: 無視、折り返し確認、通報)"],
+    "summary": "総合分析（100文字程度）"
 }}
 """
         
         response = model.generate_content(
             prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=1000,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "ai_risk_assessment": {"type": "string"},
+                        "risk_score": {"type": "number"},
+                        "business_type": {"type": "string"},
+                        "fraud_patterns": {"type": "array", "items": {"type": "string"}},
+                        "recommendations": {"type": "array", "items": {"type": "string"}},
+                        "summary": {"type": "string"}
+                    }
+                }
             )
         )
         
-        json_match = re.search(r'\{[\s\S]*\}', response.text)
-        if json_match:
-            return json.loads(json_match.group())
-        return None
+        # response.textがJSON文字列として返されるはず
+        return json.loads(response.text)
     except Exception as e:
+        st.warning(f"AI分析エラー: {str(e)}")
         return None
 
 def analyze_with_gemini(prompt, api_key):
-    """Gemini AIで分析"""
+    """Gemini AIで分析 (汎用)"""
     if not GEMINI_AVAILABLE:
         return None
     
@@ -542,33 +637,59 @@ def analyze_with_gemini(prompt, api_key):
         json_match = re.search(r'\{[\s\S]*\}', response.text)
         if json_match:
             return json.loads(json_match.group())
-        return None
+        return {"summary": response.text} # JSON形式でなくても、テキストを返す
     except Exception as e:
         st.error(f"❌ AI分析エラー: {str(e)}")
         return None
 
-def display_result(result):
+def display_result(result, title_override=None):
     """結果表示（Web/メール用）"""
-    if result['risk_level'] == '危険':
-        st.markdown(f'<div class="risk-high"><h3>🚨 高リスク ({result["risk_score"]}/100)</h3></div>', unsafe_allow_html=True)
-    elif result['risk_level'] == '注意':
-        st.markdown(f'<div class="risk-medium"><h3>⚠️ 中リスク ({result["risk_score"]}/100)</h3></div>', unsafe_allow_html=True)
+    risk_level = result['risk_level']
+    risk_score = result['risk_score']
+    
+    # AI分析結果を統合
+    ai_summary = None
+    if result.get('ai_analysis'):
+        ai = result['ai_analysis']
+        ai_summary = ai.get('summary')
+        ai_risk_level = ai.get('ai_risk_assessment')
+        ai_score = ai.get('risk_score', 0)
+        
+        # リスクレベルをAIとローカルのMAXで更新
+        if ai_risk_level == '高リスク':
+            risk_level = '危険'
+        elif ai_risk_level == '中リスク' and risk_level == '安全':
+            risk_level = '注意'
+        risk_score = max(risk_score, ai_score)
+        result['risk_level'] = risk_level # セッション内結果も更新
+        result['risk_score'] = risk_score
+    
+    # UI表示
+    if risk_level == '危険':
+        st.markdown(f'<div class="risk-high"><h3>🚨 高リスク ({risk_score}/100)</h3></div>', unsafe_allow_html=True)
+    elif risk_level == '注意':
+        st.markdown(f'<div class="risk-medium"><h3>⚠️ 中リスク ({risk_score}/100)</h3></div>', unsafe_allow_html=True)
     else:
-        st.markdown(f'<div class="risk-low"><h3>✅ 低リスク ({result["risk_score"]}/100)</h3></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="risk-low"><h3>✅ 低リスク ({risk_score}/100)</h3></div>', unsafe_allow_html=True)
     
-    st.progress(result['risk_score'] / 100)
+    st.progress(risk_score / 100)
     
+    if ai_summary:
+        st.info(f"**🤖 AI総合分析**: {ai_summary}")
+
     col_a, col_b = st.columns(2)
     with col_a:
-        st.subheader("⚠️ 警告")
+        st.subheader("⚠️ 警告・懸念点")
         if result['warnings']:
             for warning in result['warnings']:
                 st.warning(warning)
         else:
             st.success("特に問題は検出されませんでした")
-    
+            
     with col_b:
         st.subheader("📋 詳細情報")
+        if title_override == "メール":
+             st.text(f"処理された文字数: {len(result.get('content', ''))}")
         for detail in result['details']:
             st.text(detail)
 
@@ -580,7 +701,7 @@ def display_phone_result(result):
     }
     risk_emoji = {
         "安全": "✅", "注意": "⚠️",
-        "危険": "🚨", "緊急": "🚑"
+        "危険": "🚨", "緊急": "🚑", "エラー": "❌"
     }
     
     color = risk_colors.get(result['risk_level'], "gray")
@@ -600,7 +721,7 @@ def display_phone_result(result):
         
         st.info(f"""
         ### {icon} 発信者タイプ: **{caller['type']}**
-        **カテゴリ**: {caller['category']}  
+        **カテゴリ**: {caller['category']}  
         **信頼度**: {caller['confidence']}
         """)
         
@@ -627,8 +748,11 @@ def display_phone_result(result):
         if ai.get('summary'):
             st.info(f"**📝 AI総合分析**: {ai['summary']}")
         
-        if ai.get('business_type'):
-            st.text(f"業種推定: {ai['business_type']}")
+        col_ai_1, col_ai_2 = st.columns(2)
+        with col_ai_1:
+            st.text(f"AI推定リスク: {ai.get('ai_risk_assessment', '不明')}")
+        with col_ai_2:
+            st.text(f"業種推定: {ai.get('business_type', '不明')}")
         
         if ai.get('fraud_patterns'):
             with st.expander("🎯 想定される詐欺パターン"):
@@ -646,17 +770,18 @@ def display_phone_result(result):
     
     # 詳細情報
     if result['details']:
-        st.info("### 📋 詳細情報")
+        st.info("### 📋 詳細情報 (ローカル分析)")
         for detail in result['details']:
             st.markdown(f"- {detail}")
         st.markdown("")
     
     # 推奨事項
-    if result['recommendations']:
+    if result['recommendations'] or (result.get('ai_analysis') and result['ai_analysis'].get('recommendations')):
         if result['risk_level'] == "危険":
             st.error("### 💡 推奨事項")
         else:
             st.success("### 💡 推奨事項")
+            
         for rec in result['recommendations']:
             st.markdown(f"- {rec}")
         
@@ -664,6 +789,18 @@ def display_phone_result(result):
             st.markdown("**🤖 AIからの追加推奨:**")
             for rec in result['ai_analysis']['recommendations']:
                 st.markdown(f"- {rec}")
+
+def next_quiz():
+    """次のクイズへ"""
+    st.session_state.quiz_index = (st.session_state.quiz_index + 1) % len(quiz_samples)
+    st.session_state.answered = False
+
+def check_quiz(user_answer, correct_answer):
+    """クイズの回答チェック"""
+    if user_answer == correct_answer:
+        st.session_state.score += 1
+        return True
+    return False
 
 # ヘッダー
 st.markdown("""
@@ -676,3 +813,217 @@ st.markdown("""
 # サイドバー
 with st.sidebar:
     st.header("⚙️ 設定")
+    st.markdown("### 🤖 Gemini AI 利用設定")
+    
+    if GEMINI_AVAILABLE:
+        st.session_state.gemini_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            value=st.session_state.gemini_key,
+            help="電話番号チェックやメール分析の精度向上に使用します。"
+        )
+        st.session_state.use_gemini = st.checkbox(
+            "AI分析を有効にする",
+            value=st.session_state.use_gemini
+        )
+        if st.session_state.use_gemini and not st.session_state.gemini_key:
+            st.warning("AI分析を有効にするにはAPIキーを入力してください。")
+    else:
+        st.info("Gemini APIはインストールされていません。ローカルチェックのみ実行されます。")
+        st.session_state.use_gemini = False
+
+    st.markdown("---")
+    st.header("📋 履歴")
+    if st.session_state.check_history:
+        st.subheader("Web/メール履歴")
+        for i, item in enumerate(st.session_state.check_history[::-1]):
+            st.caption(f"{item['timestamp']} - {item.get('type', '不明')}: :{item['risk_level'] == '危険' and 'red' or item['risk_level'] == '注意' and 'orange' or 'green'}[{item['risk_level']}]")
+    if st.session_state.phone_check_history:
+        st.subheader("電話番号履歴")
+        for i, item in enumerate(st.session_state.phone_check_history[::-1]):
+             st.caption(f"{item['timestamp']} - {item['original']}: :{item['risk_level'] == '危険' and 'red' or item['risk_level'] == '注意' and 'orange' or 'green'}[{item['risk_level']}]")
+    
+    st.markdown("---")
+    st.header("📞 脅威データベース")
+    st.caption(f"詐欺電話通報件数: {len(st.session_state.scam_database['reported_cases'])}")
+    st.caption(f"危険ドメイン数: {len(st.session_state.threat_database['dangerous_domains']) + len(st.session_state.reported_sites)}")
+
+# メインコンテンツ
+tab1, tab2, tab3, tab4 = st.tabs(["🌐 Web/メールチェック", "📞 電話番号チェック", "🧠 セキュリティクイズ", "🚨 脅威通報"])
+
+# --- タブ1: Web/メールチェック ---
+with tab1:
+    st.header("🌐 WebサイトURL & メール本文 フィッシングチェック")
+    
+    check_type = st.radio("チェック対象を選択", ("URL", "メール本文"), horizontal=True)
+    
+    if check_type == "URL":
+        url_input = st.text_input("チェックしたいURLを入力してください", placeholder="例: http://login-verify-account.com/update")
+        
+        if st.button("URLをチェック"):
+            if url_input:
+                result = analyze_url_local(url_input)
+                
+                # AI分析（URLの意図を分析）
+                if st.session_state.use_gemini and st.session_state.gemini_key:
+                    if setup_gemini(st.session_state.gemini_key):
+                        prompt = f"""
+あなたはWebセキュリティの専門家です。以下のURLの構造と内容を分析し、フィッシングまたはマルウェアサイトの可能性を評価してください。
+URL: {url_input}
+基本分析結果: {result['risk_level']}
+
+以下を分析してJSON形式で回答:
+{{
+    "ai_risk_assessment": "高リスク/中リスク/低リスク",
+    "risk_score": 0-100,
+    "reasons": ["具体的な疑わしい点"],
+    "summary": "総合分析（100文字程度）"
+}}
+"""
+                        with st.spinner("🤖 AIが高度なURL意図分析を実行中..."):
+                            ai_result = analyze_phone_with_gemini(url_input, result, st.session_state.gemini_key) # analyze_phone_with_geminiを流用
+                            result["ai_analysis"] = ai_result
+                
+                st.session_state.check_history.append({"timestamp": datetime.now().strftime("%H:%M:%S"), "type": "URL", "url": url_input, **result})
+                display_result(result, title_override="URL")
+            else:
+                st.warning("URLを入力してください。")
+                
+    elif check_type == "メール本文":
+        email_subject = st.text_input("件名（オプション）", placeholder="例: 【重要】あなたのアカウントが一時停止されました")
+        email_content = st.text_area("メール本文を貼り付けてください", height=300, placeholder="例: セキュリティ上の理由から、以下のリンクをクリックして本人確認を行ってください...")
+        
+        if st.button("メール本文をチェック"):
+            if email_content:
+                full_content = f"件名: {email_subject}\n\n本文: {email_content}"
+                result = analyze_email_local(full_content)
+                result['content'] = full_content # 履歴用に保存
+
+                # AI分析
+                if st.session_state.use_gemini and st.session_state.gemini_key:
+                    if setup_gemini(st.session_state.gemini_key):
+                        with st.spinner("🤖 AIがメール内容のフィッシング分析を実行中..."):
+                            ai_result = analyze_email_with_gemini(full_content)
+                            result["ai_analysis"] = ai_result
+                
+                st.session_state.check_history.append({"timestamp": datetime.now().strftime("%H:%M:%S"), "type": "メール", "subject": email_subject, **result})
+                display_result(result, title_override="メール")
+            else:
+                st.warning("メール本文を入力してください。")
+
+# --- タブ2: 電話番号詐欺チェック ---
+with tab2:
+    st.header("📞 電話番号 詐欺・迷惑電話チェック")
+    
+    phone_number_input = st.text_input("チェックしたい電話番号を入力してください", placeholder="例: 090-XXXX-XXXX または +81-3-XXXX-XXXX")
+    
+    if st.button("電話番号をチェック"):
+        if phone_number_input:
+            result = analyze_phone_number(
+                phone_number_input,
+                use_ai=st.session_state.use_gemini,
+                api_key=st.session_state.gemini_key
+            )
+            display_phone_result(result)
+        else:
+            st.warning("電話番号を入力してください。")
+
+# --- タブ3: セキュリティクイズ ---
+with tab3:
+    st.header("🧠 セキュリティ知識クイズ")
+    st.subheader(f"現在のスコア: {st.session_state.score} / {len(quiz_samples)}問中")
+
+    current_quiz = quiz_samples[st.session_state.quiz_index]
+    
+    st.markdown("---")
+    st.markdown(f"### 第{st.session_state.quiz_index + 1}問: これはフィッシングメールですか？")
+    
+    st.info(f"**件名**: {current_quiz['subject']}")
+    st.code(current_quiz['content'], language="text")
+    
+    col_q, col_n = st.columns([1, 1])
+    
+    with col_q:
+        user_choice = st.radio("あなたの回答", ("フィッシングである", "フィッシングではない"), disabled=st.session_state.answered, key=f"quiz_{st.session_state.quiz_index}")
+        
+    if not st.session_state.answered:
+        if st.button("回答する", key="submit_quiz"):
+            st.session_state.answered = True
+            
+            is_correct = check_quiz(user_choice == "フィッシングである", current_quiz['is_phishing'])
+            
+            if is_correct:
+                st.success("🎉 正解！セキュリティ意識が高いですね。")
+            else:
+                st.error("❌ 不正解... もう一度注意深く確認しましょう。")
+            
+            st.markdown("### 💡 解説")
+            st.markdown(current_quiz['explanation'])
+            st.button("次の問題へ", on_click=next_quiz)
+
+    else:
+        # 回答後の表示ロジック
+        is_correct = (user_choice == "フィッシングである") == current_quiz['is_phishing']
+        if is_correct:
+            st.success("🎉 正解！セキュリティ意識が高いですね。")
+        else:
+            st.error("❌ 不正解... もう一度注意深く確認しましょう。")
+            
+        st.markdown("### 💡 解説")
+        st.markdown(current_quiz['explanation'])
+        st.button("次の問題へ", on_click=next_quiz)
+
+# --- タブ4: 脅威通報 ---
+with tab4:
+    st.header("🚨 詐欺・不審情報の通報")
+    st.info("🚨 通報された情報は、**このアプリのセッション内でのみ**他のユーザー（あなた自身）のチェックに役立てられます。外部の警察や公的機関には通報されません。")
+    
+    report_type = st.radio("通報の種類", ("不審なURL/ドメイン", "詐欺・迷惑電話番号"), horizontal=True)
+    
+    if report_type == "不審なURL/ドメイン":
+        reported_url = st.text_input("不審なURLまたはドメイン", placeholder="例: scam-site.xyz/login")
+        report_desc_url = st.text_area("通報理由・被害内容（簡単に）", placeholder="例: Amazonを装って個人情報を要求された")
+        
+        if st.button("URL/ドメインを通報"):
+            if reported_url and report_desc_url:
+                try:
+                    domain = urlparse(reported_url).netloc.lower()
+                    if not domain:
+                        domain = reported_url # URLでなければ全体をドメインと見なす
+                        
+                    if domain not in st.session_state.reported_sites:
+                        st.session_state.reported_sites.append(domain)
+                        st.session_state.threat_database["dangerous_domains"].append(domain) # ドメインDBに追加
+                        st.success(f"✅ ドメイン **{domain}** をデータベースに追加しました。")
+                    else:
+                        st.info("このドメインは既に通報されています。")
+                        
+                    st.caption(f"通報内容: {report_desc_url}")
+                except Exception as e:
+                    st.error(f"URL解析エラー: {e}")
+            else:
+                st.warning("URLと通報理由を入力してください。")
+                
+    elif report_type == "詐欺・迷惑電話番号":
+        reported_number = st.text_input("不審な電話番号", placeholder="例: 090-XXXX-XXXX")
+        report_desc_phone = st.text_area("通報理由・被害内容（簡単に）", placeholder="例: 突然、未払いの料金があると脅された")
+        
+        if st.button("電話番号を通報"):
+            normalized_number = re.sub(r'[-\s()]+', '', reported_number)
+            if normalized_number and report_desc_phone:
+                # 既知の詐欺番号に追加（セッション内でのみ）
+                if normalized_number not in [re.sub(r'[-\s()]+', '', d) for d in st.session_state.scam_database["known_scam_numbers"]]:
+                    st.session_state.scam_database["known_scam_numbers"].append(normalized_number)
+                
+                # 通報ケースとして追加（詳細な通報情報）
+                st.session_state.scam_database["reported_cases"].append({
+                    "number": reported_number,
+                    "description": report_desc_phone,
+                    "reports": 1,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                
+                st.success(f"✅ 電話番号 **{reported_number}** をデータベースに追加し、通報内容を記録しました。")
+                st.caption(f"通報内容: {report_desc_phone}")
+            else:
+                st.warning("電話番号と通報理由を入力してください。")
